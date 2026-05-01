@@ -1,0 +1,12 @@
+my-alerts/
+├── .github/
+│   └── workflows/
+│       └── alerts.yml
+├── src/
+│   ├── run.py
+│   ├── sources.py
+│   └── notifier.py
+├── state.json
+├── requirements.txt
+├── .gitignore
+└── README.md          ← this file
