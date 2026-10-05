@@ -1,0 +1,139 @@
+"""
+election_alerts.py - market-moving election alerts, sent through ntfy.
+
+Built for a system that runs on GitHub Actions and pushes to ntfy:
+  1. Scheduled elections: curated, tiered watchlist -> alerts at T-14, T-3, T-1, and day-of.
+  2. Snap elections: scan_headline() - call it on each headline your news script already pulls.
+
+Setup:
+  - Uses the same ntfy topic as your existing system via the NTFY_TOPIC environment variable
+    (set from a GitHub secret in your workflow). Optional: NTFY_SERVER (default https://ntfy.sh),
+    NTFY_TOKEN if your topic is access-protected.
+  - No pip installs needed (standard library only).
+  - Stateless by design: GitHub Actions runners are wiped after every run, so instead of
+    remembering what was sent, each scheduled alert fires only on the exact day it is due.
+    Run check_scheduled() ONCE per day (one daily workflow run), or it will repeat that day.
+"""
+
+import os
+import re
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+
+LEAD_DAYS = [14, 3, 1, 0]   # days before each vote to alert
+
+# Tier 1 = can move global/US assets. Tier 2 = moves that country's assets / one of your names.
+# status: "confirmed" | "conditional" (e.g. runoff only if needed) | "verify" (date not re-checked)
+# Dates checked Oct 5, 2026. Re-verify anything marked "verify", and every entry about monthly.
+WATCHLIST = [
+    {"name": "Brazil presidential runoff", "country": "Brazil", "date": "2026-10-25",
+     "status": "conditional", "tier": 2, "assets": ["EWZ", "USD/BRL", "PBR", "Ibovespa"],
+     "note": "Only if no one cleared 50% on Oct 4. Market reads it as a fiscal-credibility vote."},
+    {"name": "Israel Knesset election", "country": "Israel", "date": "2026-10-27",
+     "status": "confirmed", "tier": 2, "assets": ["EIS", "USD/ILS", "oil (regional risk)"],
+     "note": "Coalition math matters more than the headline vote; formation can take weeks."},
+    {"name": "US midterm elections", "country": "United States", "date": "2026-11-03",
+     "status": "confirmed", "tier": 1, "assets": ["SPY", "QQQ", "VIX", "TLT", "DXY", "your options book"],
+     "note": "Congress control -> fiscal/tariff/AI policy path. Watch implied vol into the date."},
+    {"name": "Taiwan local elections", "country": "Taiwan", "date": "2026-11-28",
+     "status": "verify", "tier": 2, "assets": ["TSM", "EWT", "USD/TWD", "SMH"],
+     "note": "Local, not national, but read as a referendum on cross-strait stance."},
+    {"name": "New Zealand general election", "country": "New Zealand", "date": "2026-12-19",
+     "status": "verify", "tier": 2, "assets": ["NZD/USD", "ENZL"],
+     "note": "'Must be held by' date; actual date may be earlier."},
+]
+
+# Strong phrases alert on their own. Weak phrases ("president resigns") also hit
+# company/university news, so they only alert when a priority country is named too.
+STRONG_PATTERNS = [
+    r"snap election", r"early election", r"calls? (an |a general )?election",
+    r"dissolv(e|es|ed|ing) (the )?(parliament|lower house|diet|national assembly|knesset|bundestag)",
+    r"no[- ]confidence (vote|motion)",
+]
+WEAK_PATTERNS = [
+    r"government collapses?", r"coalition collapses?",
+    r"prime minister resigns?", r"president resigns?",
+]
+STRONG_RE = re.compile("|".join(STRONG_PATTERNS), re.IGNORECASE)
+WEAK_RE = re.compile("|".join(WEAK_PATTERNS), re.IGNORECASE)
+
+SNAP_PRIORITY = ["japan", "united kingdom", "uk", "britain", "france", "germany",
+                 "canada", "taiwan", "south korea", "india", "mexico", "italy"]
+
+_seen_this_run: set = set()   # avoids sending the same snap headline twice in one run
+
+
+def notify(title: str, body: str, priority: str = "default", tags: str = "ballot_box_with_ballot") -> None:
+    """Send a push through ntfy. Falls back to printing if NTFY_TOPIC isn't set (local testing)."""
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        print(f"[NTFY_TOPIC not set - would send]\n{title}\n{body}\n")
+        return
+    server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+    headers = {
+        # HTTP headers must be plain ASCII; strip anything else so the send never crashes.
+        "Title": title.encode("ascii", "ignore").decode(),
+        "Priority": priority,
+        "Tags": tags,
+    }
+    token = os.environ.get("NTFY_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{server}/{topic}", data=body.encode("utf-8"),
+                                 headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def _today_central() -> date:
+    """GitHub Actions runs in UTC; use US Central so 'days until' matches your calendar."""
+    return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
+
+
+def check_scheduled(today: date | None = None, max_tier: int = 2) -> int:
+    """Send any election alerts due today. Run once per day. Returns number sent."""
+    today = today or _today_central()
+    count = 0
+    for e in WATCHLIST:
+        if e["tier"] > max_tier:
+            continue
+        days_out = (datetime.strptime(e["date"], "%Y-%m-%d").date() - today).days
+        if days_out not in LEAD_DAYS:
+            continue
+        when = "TODAY" if days_out == 0 else f"in {days_out} day{'s' if days_out != 1 else ''}"
+        flag = {"confirmed": "", "conditional": " (conditional)",
+                "verify": " (DATE UNVERIFIED - re-check)"}[e["status"]]
+        priority = "high" if e["tier"] == 1 or days_out <= 1 else "default"
+        notify(
+            f'Tier {e["tier"]} election {when}: {e["name"]}{flag}',
+            f'{e["country"]} votes {e["date"]}.\nWatch: {", ".join(e["assets"])}\n{e["note"]}',
+            priority=priority,
+        )
+        count += 1
+    return count
+
+
+def scan_headline(headline: str, source: str = "") -> bool:
+    """Call on each headline your news script already pulls (after its own duplicate filter).
+    Sends an alert if the headline looks like a snap election is being triggered."""
+    key = headline.strip().lower()
+    priority_country = any(re.search(rf"\b{re.escape(c)}\b", key) for c in SNAP_PRIORITY)
+    strong = bool(STRONG_RE.search(headline))
+    weak = bool(WEAK_RE.search(headline))
+    if not (strong or (weak and priority_country)):
+        return False
+    if key in _seen_this_run:
+        return False
+    _seen_this_run.add(key)
+    notify(
+        f'{"PRIORITY " if priority_country else ""}Possible snap election',
+        f'{headline}\n{source}\nCheck: local equity ETF, currency, and whether any of your names have exposure.',
+        priority="high" if priority_country else "default",
+        tags="rotating_light",
+    )
+    return True
+
+
+if __name__ == "__main__":
+    n = check_scheduled()
+    print(f"election alerts sent: {n}")
